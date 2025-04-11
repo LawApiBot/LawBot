@@ -1,14 +1,16 @@
 import os
 from typing import Dict, Optional
 import logging
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse
 import httpx
 from pydantic import BaseModel
 import uvicorn
 from openai import OpenAI
-from dotenv import load_dotenv
-load_dotenv() 
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -23,9 +25,100 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # Environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# In-memory storage for user threads (in production, use a database)
-user_threads: Dict[int, str] = {}
+# Global shared thread ID
+SHARED_THREAD_ID = None
+
+@contextmanager
+def get_db_connection():
+    """Context manager for database connections"""
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = False
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_db():
+    """Initialize the database with required tables"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        # Create users table to store user information
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        
+        # Create messages table to store message history
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (chat_id) REFERENCES users (chat_id)
+        )
+        ''')
+        
+        # Create shared_thread table to store the global thread ID
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS shared_thread (
+            id SERIAL PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        
+        conn.commit()
+
+# Initialize database on startup
+init_db()
+
+def get_or_create_shared_thread():
+    """Get the shared thread ID or create a new one if it doesn't exist"""
+    global SHARED_THREAD_ID
+    
+    # If we already have the thread ID in memory, return it
+    if SHARED_THREAD_ID:
+        return SHARED_THREAD_ID
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Try to get existing thread from database
+        cursor.execute("SELECT thread_id FROM shared_thread ORDER BY created_at DESC LIMIT 1")
+        thread_record = cursor.fetchone()
+        
+        if thread_record:
+            SHARED_THREAD_ID = thread_record["thread_id"]
+            logger.info(f"Using existing shared thread: {SHARED_THREAD_ID}")
+            return SHARED_THREAD_ID
+        
+        # Create new thread with OpenAI
+        thread = client.beta.threads.create()
+        SHARED_THREAD_ID = thread.id
+        
+        # Store the new thread ID
+        cursor.execute(
+            "INSERT INTO shared_thread (thread_id) VALUES (%s)",
+            (SHARED_THREAD_ID,)
+        )
+        conn.commit()
+        
+        logger.info(f"Created new shared thread: {SHARED_THREAD_ID}")
+        return SHARED_THREAD_ID
 
 # Telegram API base URL
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -71,25 +164,78 @@ async def send_chat_action(chat_id: int, action: str = "typing"):
             json={"chat_id": chat_id, "action": action}
         )
 
-async def process_message(chat_id: int, text: str):
+def register_user(chat_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    """Register a user or update their last interaction time"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Check if user exists
+        cursor.execute("SELECT chat_id FROM users WHERE chat_id = %s", (chat_id,))
+        user = cursor.fetchone()
+        
+        if user:
+            # Update last interaction time
+            cursor.execute(
+                "UPDATE users SET last_interaction = NOW(), username = %s, first_name = %s, last_name = %s WHERE chat_id = %s",
+                (username, first_name, last_name, chat_id)
+            )
+        else:
+            # Insert new user
+            cursor.execute(
+                """
+                INSERT INTO users (chat_id, username, first_name, last_name)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (chat_id, username, first_name, last_name)
+            )
+        
+        conn.commit()
+
+def store_message(chat_id: int, role: str, content: str, username: str = None, first_name: str = None, last_name: str = None):
+    """Store a message in the database"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO messages (chat_id, username, first_name, last_name, role, content) VALUES (%s, %s, %s, %s, %s, %s)",
+            (chat_id, username, first_name, last_name, role, content)
+        )
+        conn.commit()
+
+def get_user_display_name(username: str = None, first_name: str = None, last_name: str = None):
+    """Get a display name for the user"""
+    if username:
+        return f"@{username}"
+    elif first_name and last_name:
+        return f"{first_name} {last_name}"
+    elif first_name:
+        return first_name
+    else:
+        return "Anonymous User"
+
+async def process_message(chat_id: int, text: str, username: str = None, first_name: str = None, last_name: str = None):
     """Process a message from a Telegram user"""
     try:
-        # Get or create a thread for this user
-        thread_id = user_threads.get(chat_id)
-        if not thread_id:
-            thread = client.beta.threads.create()
-            thread_id = thread.id
-            user_threads[chat_id] = thread_id
-            logger.info(f"Created new thread {thread_id} for user {chat_id}")
+        # Register or update the user
+        register_user(chat_id, username, first_name, last_name)
+        
+        # Store the user message
+        store_message(chat_id, "user", text, username, first_name, last_name)
+        
+        # Get the shared thread ID
+        thread_id = get_or_create_shared_thread()
         
         # Send typing indicator
         await send_chat_action(chat_id, "typing")
+        
+        # Format the message to include user identification
+        user_display = get_user_display_name(username, first_name, last_name)
+        formatted_message = f"{user_display}: {text}"
         
         # Add the user's message to the thread
         client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
-            content=text
+            content=formatted_message
         )
         
         # Run the Assistant on the thread
@@ -137,6 +283,9 @@ async def process_message(chat_id: int, text: str):
             if content_part.type == "text":
                 response_text += content_part.text.value
         
+        # Store the assistant's response
+        store_message(chat_id, "assistant", response_text)
+        
         # Send the assistant's response back to the user
         await send_telegram_message(chat_id, response_text)
         
@@ -157,6 +306,12 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         message = update["message"]
         chat_id = message["chat"]["id"]
         
+        # Extract user information
+        chat = message["chat"]
+        username = chat.get("username")
+        first_name = chat.get("first_name")
+        last_name = chat.get("last_name")
+        
         # Check if the message contains text
         if "text" not in message:
             await send_telegram_message(chat_id, "I can only process text messages.")
@@ -165,7 +320,14 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         text = message["text"]
         
         # Process the message in the background
-        background_tasks.add_task(process_message, chat_id, text)
+        background_tasks.add_task(
+            process_message, 
+            chat_id, 
+            text, 
+            username, 
+            first_name, 
+            last_name
+        )
         
         return JSONResponse(content={"status": "processing"})
         
@@ -175,6 +337,88 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             content={"status": "error", "detail": str(e)},
             status_code=500
         )
+
+@app.get("/users")
+async def list_users():
+    """List all users (admin endpoint)"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT chat_id, username, first_name, last_name, 
+                   created_at, last_interaction 
+            FROM users
+            ORDER BY last_interaction DESC
+        """)
+        users = cursor.fetchall()
+        
+        return {"users": list(users)}
+
+@app.get("/messages")
+async def get_all_messages(limit: int = 100):
+    """Get recent message history for all users (admin endpoint)"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT m.id, m.chat_id, m.username, m.first_name, m.last_name, 
+                   m.role, m.content, m.timestamp
+            FROM messages m
+            ORDER BY m.timestamp DESC
+            LIMIT %s
+        """, (limit,))
+        messages = cursor.fetchall()
+        
+        return {"messages": list(messages)}
+
+@app.get("/thread")
+async def get_thread_info():
+    """Get information about the shared thread (admin endpoint)"""
+    thread_id = get_or_create_shared_thread()
+    
+    # Get messages from OpenAI
+    messages = client.beta.threads.messages.list(thread_id=thread_id)
+    
+    # Format messages for response
+    formatted_messages = []
+    for msg in messages.data:
+        content_text = ""
+        for content_part in msg.content:
+            if content_part.type == "text":
+                content_text += content_part.text.value
+        
+        formatted_messages.append({
+            "id": msg.id,
+            "role": msg.role,
+            "content": content_text,
+            "created_at": msg.created_at
+        })
+    
+    return {
+        "thread_id": thread_id,
+        "messages": formatted_messages
+    }
+
+@app.post("/reset-thread")
+async def reset_thread():
+    """Reset the shared thread (admin endpoint)"""
+    global SHARED_THREAD_ID
+    
+    # Create a new thread
+    thread = client.beta.threads.create()
+    new_thread_id = thread.id
+    
+    # Update the database
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO shared_thread (thread_id) VALUES (%s)",
+            (new_thread_id,)
+        )
+        conn.commit()
+    
+    # Update the global variable
+    SHARED_THREAD_ID = new_thread_id
+    
+    return {"status": "success", "message": "Thread reset successfully", "new_thread_id": new_thread_id}
 
 if __name__ == "__main__":
     # Run the FastAPI app with uvicorn

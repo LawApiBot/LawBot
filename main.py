@@ -26,7 +26,7 @@ SUPPORTED_FILE_TYPES = {
     'image/jpeg': 'image'
 }
 
-MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
+MAX_FILE_SIZE = 512 * 1024 * 1024  # 15 MB
 
 
 # Добавьте новые функции обработки файлов

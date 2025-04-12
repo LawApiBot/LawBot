@@ -16,6 +16,8 @@ from PIL import Image
 import pytesseract
 from PyPDF2 import PdfReader
 import docx
+import tempfile
+from pathlib import Path
 
 # Добавьте в начало с остальными настройками
 SUPPORTED_FILE_TYPES = {
@@ -277,7 +279,7 @@ def get_user_display_name(username: str = None, first_name: str = None, last_nam
 async def process_message(
         chat_id: int,
         text: Optional[str] = None,
-        file_content: Optional[str] = None,
+        file_id: Optional[str] = None,  # Изменяем параметр на file_id вместо содержимого
         username: str = None,
         first_name: str = None,
         last_name: str = None
@@ -286,7 +288,7 @@ async def process_message(
         register_user(chat_id, username, first_name, last_name)
 
         # Определяем тип контента
-        content = text if text else file_content
+        content = text if text else "Анализ прикрепленного файла"
         content_type = "text" if text else "file"
 
         # Сохраняем сообщение с указанием типа
@@ -298,11 +300,17 @@ async def process_message(
         user_display = get_user_display_name(username, first_name, last_name)
         formatted_message = f"{user_display} [{content_type}]: {content}"
 
-        client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=formatted_message
-        )
+        # Создаем сообщение с file_id если есть
+        message_data = {
+            "thread_id": thread_id,
+            "role": "user",
+            "content": formatted_message
+        }
+
+        if file_id:
+            message_data["file_ids"] = [file_id]
+
+        client.beta.threads.messages.create(**message_data)
 
         run = client.beta.threads.runs.create(
             thread_id=thread_id,
@@ -359,6 +367,30 @@ async def process_message(
         await send_telegram_message(chat_id, "Sorry, an error occurred while processing your message.")
 
 
+async def upload_file_to_openai(file_content: bytes, file_name: str) -> Optional[str]:
+    try:
+        # Создаем временный файл
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file.flush()
+
+            # Загружаем файл в OpenAI
+            with open(tmp_file.name, "rb") as file:
+                response = client.files.create(
+                    file=file,
+                    purpose="assistants",
+                    file_name=file_name
+                )
+
+            return response.id
+    except Exception as e:
+        logger.error(f"Error uploading file to OpenAI: {e}")
+        return None
+    finally:
+        # Удаляем временный файл
+        Path(tmp_file.name).unlink(missing_ok=True)
+
+
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
@@ -393,9 +425,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             if "document" in message:
                 file_info = message["document"]
                 mime_type = file_info.get("mime_type")
+                file_name = file_info.get("file_name", "file")
             else:
                 file_info = message["photo"][-1]  # Берем самую большую фотографию
                 mime_type = "image/jpeg"
+                file_name = "photo.jpg"
 
             # Проверяем поддержку формата
             if mime_type not in SUPPORTED_FILE_TYPES:
@@ -410,20 +444,19 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             # Скачиваем файл
             file_content = await download_telegram_file(file_info["file_id"])
 
-            # Извлекаем текст
-            file_type = SUPPORTED_FILE_TYPES[mime_type]
-            extracted_text = extract_text_from_file(file_content, file_type)
+            # Загружаем файл в OpenAI
+            file_id = await upload_file_to_openai(file_content, file_name)
 
-            if not extracted_text:
-                await send_telegram_message(chat_id, "❌ Could not extract text from file")
-                return JSONResponse(content={"status": "extraction_error"})
+            if not file_id:
+                await send_telegram_message(chat_id, "❌ Failed to process file")
+                return JSONResponse(content={"status": "upload_error"})
 
-            # Обрабатываем извлеченный текст
+            # Обрабатываем файл через OpenAI
             background_tasks.add_task(
                 process_message,
                 chat_id,
                 None,
-                extracted_text,
+                file_id,  # Передаем file_id вместо текста
                 username,
                 first_name,
                 last_name

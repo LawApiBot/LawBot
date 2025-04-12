@@ -11,6 +11,68 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from datetime import datetime
+import io
+from PIL import Image
+import pytesseract
+from PyPDF2 import PdfReader
+import docx
+
+# Добавьте в начало с остальными настройками
+SUPPORTED_FILE_TYPES = {
+    'text/plain': 'txt',
+    'application/pdf': 'pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'image/png': 'image',
+    'image/jpeg': 'image'
+}
+
+MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
+
+
+# Добавьте новые функции обработки файлов
+async def download_telegram_file(file_id: str):
+    async with httpx.AsyncClient() as client:
+        # Получаем информацию о файле
+        file_info = await client.get(
+            f"{TELEGRAM_API_URL}/getFile?file_id={file_id}"
+        )
+        file_path = file_info.json()['result']['file_path']
+
+        # Скачиваем файл
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        file_response = await client.get(file_url)
+        return file_response.content
+
+
+def extract_text_from_file(content: bytes, file_type: str):
+    try:
+        # Обработка текстовых файлов
+        if file_type == 'txt':
+            return content.decode('utf-8')
+
+        # Обработка PDF
+        elif file_type == 'pdf':
+            text = ""
+            pdf = PdfReader(io.BytesIO(content))
+            for page in pdf.pages:
+                text += page.extract_text()
+            return text
+
+        # Обработка Word документов
+        elif file_type == 'docx':
+            doc = docx.Document(io.BytesIO(content))
+            return "\n".join([para.text for para in doc.paragraphs])
+
+        # Обработка изображений с OCR
+        elif file_type == 'image':
+            image = Image.open(io.BytesIO(content))
+            return pytesseract.image_to_string(image)
+
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Error extracting text: {e}")
+        return None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

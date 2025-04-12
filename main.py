@@ -296,41 +296,80 @@ async def process_message(
         logger.exception(f"Error processing message: {e}")
         await send_telegram_message(chat_id, "Sorry, an error occurred while processing your message.")
 
+
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle incoming webhook requests from Telegram"""
     try:
         update = await request.json()
 
-        # Check if this is a message update
         if "message" not in update:
             return JSONResponse(content={"status": "No message in update"})
 
         message = update["message"]
         chat_id = message["chat"]["id"]
-
-        # Extract user information
         chat = message["chat"]
         username = chat.get("username")
         first_name = chat.get("first_name")
         last_name = chat.get("last_name")
 
-        # Check if the message contains text
-        if "text" not in message:
-            await send_telegram_message(chat_id, "I can only process text messages.")
-            return JSONResponse(content={"status": "No text in message"})
+        # Обработка текстовых сообщений
+        if "text" in message:
+            text = message["text"]
+            background_tasks.add_task(
+                process_message,
+                chat_id,
+                text,
+                None,
+                username,
+                first_name,
+                last_name
+            )
 
-        text = message["text"]
+        # Обработка файлов
+        elif "document" in message or "photo" in message:
+            # Получаем информацию о файле
+            if "document" in message:
+                file_info = message["document"]
+                mime_type = file_info.get("mime_type")
+            else:
+                file_info = message["photo"][-1]  # Берем самую большую фотографию
+                mime_type = "image/jpeg"
 
-        # Process the message in the background
-        background_tasks.add_task(
-            process_message,
-            chat_id,
-            text,
-            username,
-            first_name,
-            last_name
-        )
+            # Проверяем поддержку формата
+            if mime_type not in SUPPORTED_FILE_TYPES:
+                await send_telegram_message(chat_id, "❌ Unsupported file type")
+                return JSONResponse(content={"status": "unsupported_file_type"})
+
+            # Проверяем размер файла
+            if file_info.get("file_size", 0) > MAX_FILE_SIZE:
+                await send_telegram_message(chat_id, "❌ File is too large (max 15MB)")
+                return JSONResponse(content={"status": "file_too_large"})
+
+            # Скачиваем файл
+            file_content = await download_telegram_file(file_info["file_id"])
+
+            # Извлекаем текст
+            file_type = SUPPORTED_FILE_TYPES[mime_type]
+            extracted_text = extract_text_from_file(file_content, file_type)
+
+            if not extracted_text:
+                await send_telegram_message(chat_id, "❌ Could not extract text from file")
+                return JSONResponse(content={"status": "extraction_error"})
+
+            # Обрабатываем извлеченный текст
+            background_tasks.add_task(
+                process_message,
+                chat_id,
+                None,
+                extracted_text,
+                username,
+                first_name,
+                last_name
+            )
+
+        else:
+            await send_telegram_message(chat_id, "❌ I can only process text and files")
+            return JSONResponse(content={"status": "unsupported_content"})
 
         return JSONResponse(content={"status": "processing"})
 
@@ -340,7 +379,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             content={"status": "error", "detail": str(e)},
             status_code=500
         )
-
 @app.get("/users")
 async def list_users():
     """List all users (admin endpoint)"""

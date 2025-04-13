@@ -367,7 +367,7 @@ async def process_message(
         await send_telegram_message(chat_id, "Sorry, an error occurred while processing your message.")
 
 
-async def upload_file_to_openai(file_content: bytes, file_name: str) -> Optional[str]:
+async def upload_file_to_openai(file_content: bytes) -> Optional[str]:
     try:
         # Создаем временный файл
         with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
@@ -379,7 +379,6 @@ async def upload_file_to_openai(file_content: bytes, file_name: str) -> Optional
                 response = client.files.create(
                     file=file,
                     purpose="assistants",
-                    file_name=file_name
                 )
 
             return response.id

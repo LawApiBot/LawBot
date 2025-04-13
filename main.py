@@ -28,19 +28,20 @@ SUPPORTED_FILE_TYPES = {
     'image/jpeg': 'image'
 }
 
-MAX_FILE_SIZE = 512 * 1024 * 1024  # 15 MB
+MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
 
 
 # Добавьте новые функции обработки файлов
 async def download_telegram_file(file_id: str):
     async with httpx.AsyncClient() as client:
-        # Получаем информацию о файле
-        file_info = await client.get(
-            f"{TELEGRAM_API_URL}/getFile?file_id={file_id}"
-        )
-        file_path = file_info.json()['result']['file_path']
+        response = await client.get(f"{TELEGRAM_API_URL}/getFile?file_id={file_id}")
+        data = response.json()
 
-        # Скачиваем файл
+        if not data.get("ok"):
+            logger.error(f"Telegram getFile failed: {data}")
+            return None
+
+        file_path = data['result']['file_path']
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
         file_response = await client.get(file_url)
         return file_response.content

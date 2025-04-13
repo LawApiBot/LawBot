@@ -424,11 +424,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             if "document" in message:
                 file_info = message["document"]
                 mime_type = file_info.get("mime_type")
-                file_name = file_info.get("file_name", "file")
+
             else:
                 file_info = message["photo"][-1]  # Берем самую большую фотографию
                 mime_type = "image/jpeg"
-                file_name = "photo.jpg"
+
 
             # Проверяем поддержку формата
             if mime_type not in SUPPORTED_FILE_TYPES:
@@ -444,7 +444,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             file_content = await download_telegram_file(file_info["file_id"])
 
             # Загружаем файл в OpenAI
-            file_id = await upload_file_to_openai(file_content, file_name)
+            file_id = await upload_file_to_openai(file_content)
 
             if not file_id:
                 await send_telegram_message(chat_id, "❌ Failed to process file")

@@ -308,7 +308,7 @@ async def process_message(
         }
 
         if file_id:
-            message_data["file_ids"] = [file_id]
+            message_data["attachments"] = [{"file_id": file_id, "tools": [{"type": "file_search"}]}]
 
         client.beta.threads.messages.create(**message_data)
 

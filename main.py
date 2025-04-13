@@ -367,14 +367,13 @@ async def process_message(
         await send_telegram_message(chat_id, "Sorry, an error occurred while processing your message.")
 
 
-async def upload_file_to_openai(file_content: bytes) -> Optional[str]:
+async def upload_file_to_openai(file_content: bytes, extension: str = "txt") -> Optional[str]:
     try:
-        # Создаем временный файл
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        suffix = f".{extension}"  # добавим расширение файла
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
             tmp_file.write(file_content)
             tmp_file.flush()
 
-            # Загружаем файл в OpenAI
             with open(tmp_file.name, "rb") as file:
                 response = client.files.create(
                     file=file,
@@ -386,7 +385,6 @@ async def upload_file_to_openai(file_content: bytes) -> Optional[str]:
         logger.error(f"Error uploading file to OpenAI: {e}")
         return None
     finally:
-        # Удаляем временный файл
         Path(tmp_file.name).unlink(missing_ok=True)
 
 
@@ -443,8 +441,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             # Скачиваем файл
             file_content = await download_telegram_file(file_info["file_id"])
 
-            # Загружаем файл в OpenAI
-            file_id = await upload_file_to_openai(file_content)
+            extension = SUPPORTED_FILE_TYPES.get(mime_type, "txt")
+            file_id = await upload_file_to_openai(file_content, extension=extension)
 
             if not file_id:
                 await send_telegram_message(chat_id, "❌ Failed to process file")

@@ -19,6 +19,7 @@ python-docx = "^1.1.2"
 pytesseract = "^0.3.13"
 pillow = "^11.1.0"
 python-multipart = "^0.0.20"
+asyncio = "^3.4.3"
 
 
 [build-system]

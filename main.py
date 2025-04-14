@@ -18,6 +18,7 @@ from PyPDF2 import PdfReader
 import docx
 import tempfile
 from pathlib import Path
+import asyncio
 
 # Добавьте в начало с остальными настройками
 SUPPORTED_FILE_TYPES = {
@@ -327,7 +328,7 @@ async def process_message(
         # Wait for the run to complete (in a real app, use a more sophisticated approach)
         import time
         while run_status.status not in ["completed", "failed", "cancelled", "expired"]:
-            time.sleep(1)
+            await asyncio.sleep(1)
             run_status = client.beta.threads.runs.retrieve(
                 thread_id=thread_id,
                 run_id=run.id

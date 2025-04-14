@@ -333,12 +333,14 @@ async def process_message(
                 thread_id=thread_id,
                 run_id=run.id
             )
-        
+
         if run_status.status != "completed":
             logger.error(f"Run failed with status: {run_status.status}")
             await send_telegram_message(chat_id, "Sorry, I encountered an error processing your request.")
             return
-        
+
+        logger.error(f"Run failed. Status: {run_status.status}, Last info: {run_status}")
+
         # Get the assistant's messages
         messages = client.beta.threads.messages.list(
             thread_id=thread_id
